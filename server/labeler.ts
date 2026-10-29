@@ -1,8 +1,8 @@
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { createHostClient } from "@getpaseo/client/node";
-import { relatedKeys } from "./jira.ts";
+import { getIssue } from "./jira.ts";
 import { addTimelineItem, addWorkspace, emptyRefs, type Refs } from "./refs.ts";
 
 type DaemonClient = ReturnType<typeof createHostClient>;
@@ -26,6 +26,10 @@ const RETRY_MS = 30_000;
  */
 export class Labeler {
   private readonly home = process.env.PASEO_HOME ?? join(homedir(), ".paseo");
+  // Labels this plugin created. Only these are ever deleted, so a label you made yourself survives.
+  private readonly ownedPath = join(this.home, "ticket-labels-owned.json");
+  // Present once the full transcript backfill has run. Delete it and reload the plugin to rerun.
+  private readonly backfilledPath = join(this.home, "ticket-labels-backfilled");
   private readonly dryRun: boolean;
   private client: DaemonClient | null = null;
   private stopped = false;
@@ -66,10 +70,18 @@ export class Labeler {
   }
 
   /**
-   * Labels every workspace from its title, branch and PR. With `transcripts`, also reads each
+   * Labels every workspace from its title, branch and PR. The first start also reads each
    * non-archived agent's whole timeline. Reading a closed agent's timeline loads it back into the
-   * daemon, like opening it in the app, so that part is a one-off command rather than a startup task.
+   * daemon, like opening it in the app, so later starts skip it.
    */
+  async start(): Promise<void> {
+    // ponytail: the marker is written even if some agents were skipped (logged). Retrying them on
+    // every start would re-read agents that can never load, such as a logged-out provider's.
+    const transcripts = !existsSync(this.backfilledPath);
+    await this.backfill({ transcripts });
+    if (transcripts && !this.dryRun && !this.stopped) writeFileSync(this.backfilledPath, `${new Date().toISOString()}\n`);
+  }
+
   async backfill(options: { transcripts: boolean }): Promise<void> {
     const client = await this.connect();
     const workspaces = await this.listWorkspaces(client);
@@ -90,6 +102,26 @@ export class Labeler {
       await this.labelWorkspace(client, workspace, agentsByWorkspace.get(workspace.id) ?? [], true);
     }
     console.log(`[ticket-labels] backfill scanned ${workspaces.length} workspaces`);
+  }
+
+  /**
+   * Deletes every Jira label this plugin created whose ticket is now done, which takes it off every
+   * workspace.
+   */
+  async pruneDone(): Promise<void> {
+    const client = await this.connect();
+    const owned = this.readOwned();
+    const { labels } = await client.listWorkspaceLabels();
+    for (const { name } of labels) {
+      if (this.stopped) return;
+      if (!owned.has(name) || !/^BC-\d+$/.test(name)) continue;
+      if (!(await getIssue(name, { fresh: true }))?.done) continue;
+      console.log(`[ticket-labels] ${name} is done; deleting its label`);
+      if (this.dryRun) continue;
+      await client.deleteWorkspaceLabel({ name });
+      this.updateOwned((names) => names.delete(name));
+      for (const key of this.applied) if (key.endsWith(`\0${name}`)) this.applied.delete(key);
+    }
   }
 
   /** Labels a workspace from its own fields and the newest part of one agent's timeline. */
@@ -143,11 +175,18 @@ export class Labeler {
   }
 
   private async apply(client: DaemonClient, workspaceId: string, title: string, refs: Refs): Promise<void> {
+    // Done tickets get no label. Without Jira (no credential, a failure) every key counts as open.
     const labels = new Map<string, LabelColor>();
-    for (const key of refs.jira) labels.set(key, STORY);
+    const parents = new Set<string>();
     for (const key of refs.jira) {
       if (this.stopped) return;
-      for (const parent of await relatedKeys(key)) if (!labels.has(parent)) labels.set(parent, PARENT);
+      const issue = await getIssue(key);
+      if (!issue?.done) labels.set(key, STORY);
+      for (const parent of issue?.related ?? []) parents.add(parent);
+    }
+    for (const parent of parents) {
+      if (this.stopped) return;
+      if (!labels.has(parent) && !(await getIssue(parent))?.done) labels.set(parent, PARENT);
     }
     for (const id of refs.wrike) labels.set(`W-${id}`, WRIKE);
 
@@ -155,10 +194,31 @@ export class Labeler {
     if (fresh.length === 0) return;
     console.log(`[ticket-labels] ${title}: ${fresh.map(([name]) => name).join(", ")}`);
     if (this.dryRun || this.stopped) return;
+    // ponytail: a label you create by hand in the moment between this read and the assignment below
+    // would be recorded as the plugin's. Closing that needs an atomic create-if-absent in the daemon.
+    const existing = new Set((await client.listWorkspaceLabels()).labels.map((label) => label.name));
     for (const [name, color] of fresh) {
       await client.setWorkspaceLabel({ workspaceId, label: { name, color }, assigned: true });
+      if (!existing.has(name)) this.updateOwned((names) => names.add(name));
       this.applied.add(`${workspaceId}\0${name}`);
     }
+  }
+
+  private readOwned(): Set<string> {
+    try {
+      return new Set(JSON.parse(readFileSync(this.ownedPath, "utf8")) as string[]);
+    } catch {
+      return new Set();
+    }
+  }
+
+  // Only the running plugin writes labels, and its jobs run one at a time, so this needs no lock.
+  private updateOwned(change: (names: Set<string>) => void): void {
+    const names = this.readOwned();
+    change(names);
+    const tmp = `${this.ownedPath}.tmp`;
+    writeFileSync(tmp, `${JSON.stringify([...names].sort(), null, 1)}\n`);
+    renameSync(tmp, this.ownedPath);
   }
 
   private async connect(): Promise<DaemonClient> {

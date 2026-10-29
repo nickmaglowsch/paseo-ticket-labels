@@ -11,7 +11,7 @@
   "scripts": {
     "typecheck": "tsc --noEmit",
     "test": "node --test server/*.test.ts",
-    "backfill": "node scripts/backfill.ts"
+    "preview": "node scripts/preview.ts"
   },
   "dependencies": {
     "@getpaseo/client": "0.13.0-beta.2"
