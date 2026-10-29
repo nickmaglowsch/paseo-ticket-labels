@@ -112,6 +112,9 @@ export class Labeler {
       try {
         await this.addAgent(client, refs, agentId, fullHistory);
       } catch (error) {
+        // A turn's agent was just running, so its failure is transient: let the queue retry it.
+        // Backfill meets agents that cannot load at all (a logged-out provider) and moves on.
+        if (!fullHistory) throw error;
         console.warn(`[ticket-labels] skipped agent ${agentId}: ${error instanceof Error ? error.message : error}`);
       }
     }
@@ -143,6 +146,7 @@ export class Labeler {
     const labels = new Map<string, LabelColor>();
     for (const key of refs.jira) labels.set(key, STORY);
     for (const key of refs.jira) {
+      if (this.stopped) return;
       for (const parent of await relatedKeys(key)) if (!labels.has(parent)) labels.set(parent, PARENT);
     }
     for (const id of refs.wrike) labels.set(`W-${id}`, WRIKE);
@@ -150,7 +154,7 @@ export class Labeler {
     const fresh = [...labels].filter(([name]) => !this.applied.has(`${workspaceId}\0${name}`));
     if (fresh.length === 0) return;
     console.log(`[ticket-labels] ${title}: ${fresh.map(([name]) => name).join(", ")}`);
-    if (this.dryRun) return;
+    if (this.dryRun || this.stopped) return;
     for (const [name, color] of fresh) {
       await client.setWorkspaceLabel({ workspaceId, label: { name, color }, assigned: true });
       this.applied.add(`${workspaceId}\0${name}`);
