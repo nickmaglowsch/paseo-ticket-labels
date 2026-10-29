@@ -1,0 +1,7 @@
+{
+  "id": "paseo-ticket-labels",
+  "description": "Labels workspaces with the Jira stories, their parent ticket and the Wrike ticket their agents work on",
+  "requirements": {
+    "paseo": ">=0.13.0-beta.2"
+  }
+}
